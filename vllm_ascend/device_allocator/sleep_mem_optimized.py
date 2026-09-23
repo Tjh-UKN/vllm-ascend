@@ -100,7 +100,7 @@ class AclGraphSleepWakeupManager:
         cls.reset_graph_params(acl_graph._draft_graph_params)
         cls.reset_graph_params(acl_graph._draft_graph_prefill_params)
         for wrapper in list(acl_graph._acl_graph_wrappers):
-            wrapper.concrete_aclgraph_entries.clear()
+            wrapper.clear_graphs()
             wrapper.first_run_finished = False
 
     @staticmethod

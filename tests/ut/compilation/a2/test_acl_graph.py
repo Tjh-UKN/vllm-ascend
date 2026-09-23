@@ -149,6 +149,44 @@ class TestACLGraphWrapper(TestBase):
         self.assertEqual(wrapper.aclgraph_options, self.mock_cudagraph_options)
         self.assertEqual(wrapper.concrete_aclgraph_entries, {})
 
+    @patch("vllm_ascend.compilation.acl_graph.torch")
+    @patch("vllm_ascend.compilation.acl_graph.get_forward_context")
+    @patch("vllm_ascend.compilation.acl_graph.current_platform")
+    @patch("vllm_ascend.compilation.acl_graph.envs")
+    def test_dual_graph_replay_selects_pre_captured_variant(
+        self, mock_envs, mock_current_platform, mock_context, mock_torch
+    ):
+        mock_envs.VLLM_LOGGING_LEVEL = "INFO"
+        mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
+        mock_context.return_value = self.mock_forward_context
+        wrapper = ACLGraphWrapper(
+            self.mock_runnable, self.mock_vllm_config, CUDAGraphMode.FULL,
+            self.mock_cudagraph_options,
+        )
+        clean_graph, dump_graph = MagicMock(), MagicMock()
+        clean_entries = {
+            self.mock_batch_descriptor: ACLGraphEntry(self.mock_batch_descriptor, clean_graph, "clean")
+        }
+        dump_entries = {
+            self.mock_batch_descriptor: ACLGraphEntry(self.mock_batch_descriptor, dump_graph, "dump")
+        }
+        dumper = MagicMock(dump_enable=False)
+        wrapper.set_msprobe_graph_entries(dumper, clean_entries, dump_entries)
+
+        with patch("vllm_ascend.ascend_forward_context.get_forward_context", return_value=self.mock_forward_context):
+            self.assertEqual(wrapper(), "clean")
+            clean_graph.replay.assert_called_once()
+            dump_graph.replay.assert_not_called()
+            dumper.dump_enable = True
+            self.assertEqual(wrapper(), "dump")
+            dump_graph.replay.assert_called_once()
+        self.mock_runnable.assert_not_called()
+        mock_torch.npu.NPUGraph.assert_not_called()
+
+        wrapper.clear_graphs()
+        self.assertFalse(clean_entries)
+        self.assertFalse(dump_entries)
+
     @patch("vllm_ascend.compilation.acl_graph.current_platform")
     @patch("vllm_ascend.compilation.acl_graph.envs")
     def test_initialization_assertion_error(self, mock_envs, mock_current_platform):
@@ -791,6 +829,7 @@ class TestSleepGraphParams(TestBase):
     def test_reset_graph_params_for_sleep_clears_registered_wrappers(self):
         wrapper = MagicMock()
         wrapper.concrete_aclgraph_entries = {"entry": object()}
+        wrapper.clear_graphs.side_effect = wrapper.concrete_aclgraph_entries.clear
         wrapper.first_run_finished = True
         empty_params = GraphParams(
             events={},
@@ -810,6 +849,7 @@ class TestSleepGraphParams(TestBase):
             AclGraphSleepWakeupManager.reset_all_graph_params()
 
         self.assertEqual(wrapper.concrete_aclgraph_entries, {})
+        wrapper.clear_graphs.assert_called_once()
         self.assertFalse(wrapper.first_run_finished)
 
 

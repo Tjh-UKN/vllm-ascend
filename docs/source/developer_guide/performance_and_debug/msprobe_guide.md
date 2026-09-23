@@ -57,7 +57,8 @@ Common fields are:
 | `level`     | Dump level string (`"L0"`, `"L1"`, or `"mix"`). `L0` targets `nn.Module`, `L1` targets `torch.api`, and `mix` collects both.                                                                                 |    Yes   |      ✅       |      ✅       |
 | `async_dump`| Whether to enable asynchronous dump (supported for PyTorch `statistics`/`tensor` tasks). Defaults to `false`.                                                                                              |    No    |      ✅       |      ❌       |
 | `scope`     | Module range to sample. An empty list collects every module.                                                                                                                                                |    No    |      ✅       |      ❌       |
-| `dump_enable` | Dynamic switch for enabling/disabling dump in `PrecisionDebugger` during one running training/inference job. This allows turning dump on or off on demand in the same job.                             |    No    |      ✅       |      ❌       |
+| `dump_enable` | Dynamic switch for enabling/disabling dump during one running job. In graph mode, the new value takes effect after `AclGraphDumper.step()`. | No | ✅ | ✅ |
+| `capture_both_states` | Capture clean and dump ACLGraphs before serving, then select one during replay. Defaults to `false`; requires an msProbe version with dual graph support. | No | ❌ | ✅ |
 | `list`      | Operator range to sample. An empty list collects every operator.                                                                                                                                            |    No    |      ✅       |      ✅       |
 
 To restrict the operators that are captured, configure the `list` block:
@@ -133,7 +134,7 @@ Graph mode:
      }' &
    ```
 
-   Compatibility mode (legacy) is still supported:
+    Compatibility mode (legacy) is still supported:
 
    ```bash
    vllm serve Qwen/Qwen2.5-0.5B-Instruct \
@@ -141,7 +142,9 @@ Graph mode:
      --host 0.0.0.0 \
      --port 8000 \
      --additional-config '{"dump_config_path": "/data/msprobe_config.json"}' &
-   ```
+    ```
+
+    To keep replay latency close to the undumped model while `dump_enable` is false, set both `"dump_enable": false` and `"capture_both_states": true` in the dump configuration. Startup captures both graph variants for each batch descriptor, so capture time and graph memory use increase. This mode currently supports decoder graphs; multimodal encoder graphs are rejected at startup.
 
 ## 4. Send requests and collect dumps
 

@@ -124,6 +124,10 @@ class ACLGraphWrapper:
         # the entries for different batch descriptors that we need to capture
         # aclgraphs for.
         self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
+        self._msprobe_graph_entries: tuple[
+            dict[BatchDescriptor, ACLGraphEntry], dict[BatchDescriptor, ACLGraphEntry]
+        ] | None = None
+        self._msprobe_dumper: Any | None = None
         self.enable_enpu = enable_enpu
         self.use_eagle = use_eagle
         _acl_graph_wrappers.add(self)
@@ -150,6 +154,23 @@ class ACLGraphWrapper:
 
     def clear_graphs(self) -> None:
         self.concrete_aclgraph_entries.clear()
+        if self._msprobe_graph_entries is not None:
+            for entries in self._msprobe_graph_entries:
+                entries.clear()
+        self._msprobe_graph_entries = None
+        self._msprobe_dumper = None
+
+    def set_msprobe_graph_entries(
+        self,
+        dumper: Any,
+        clean_entries: dict[BatchDescriptor, ACLGraphEntry],
+        dump_entries: dict[BatchDescriptor, ACLGraphEntry],
+    ) -> None:
+        if clean_entries.keys() != dump_entries.keys():
+            raise RuntimeError("The clean and dump ACLGraph captures have different batch descriptors")
+        self._msprobe_graph_entries = (clean_entries, dump_entries)
+        self._msprobe_dumper = dumper
+        self.concrete_aclgraph_entries = dump_entries
 
     def __call__(self, *args, **kwargs):
         forward_context = get_forward_context()
@@ -165,11 +186,17 @@ class ACLGraphWrapper:
             # runtime modes.
             return self.runnable(*args, **kwargs)
 
-        if batch_descriptor not in self.concrete_aclgraph_entries:
-            # create a new entry for this batch descriptor
-            self.concrete_aclgraph_entries[batch_descriptor] = ACLGraphEntry(batch_descriptor=batch_descriptor)
+        entries = self.concrete_aclgraph_entries
+        if self._msprobe_graph_entries is not None:
+            entries = self._msprobe_graph_entries[bool(self._msprobe_dumper.dump_enable)]
 
-        entry = self.concrete_aclgraph_entries[batch_descriptor]
+        if batch_descriptor not in entries:
+            # create a new entry for this batch descriptor
+            if self._msprobe_graph_entries is not None:
+                raise RuntimeError(f"No pre-captured ACLGraph for batch descriptor {batch_descriptor}")
+            entries[batch_descriptor] = ACLGraphEntry(batch_descriptor=batch_descriptor)
+
+        entry = entries[batch_descriptor]
 
         if entry.aclgraph is None:
             if self.aclgraph_options.debug_log_enable:

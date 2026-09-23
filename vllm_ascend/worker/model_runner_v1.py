@@ -3798,6 +3798,32 @@ class NPUModelRunner(GPUModelRunner):
 
         self.debugger.step(**kwargs)
 
+    def _msprobe_dual_graph_dumper(self):
+        dumper = getattr(self, "debugger", None)
+        return dumper if getattr(dumper, "capture_both_states", False) is True and dumper.is_running is True else None
+
+    def _capture_msprobe_graph_variants(self, capture_fn, *args, **kwargs):
+        dumper = self._msprobe_dual_graph_dumper()
+        if dumper is None or not getattr(self, "_msprobe_dual_graph_capturing", False):
+            return capture_fn(*args, **kwargs)
+
+        graph_entries = self._msprobe_dual_graph_entries
+        result = None
+        for enabled in (False, True):
+            for wrapper in list(ACLGraphWrapper._all_instances):
+                if wrapper.vllm_config is self.vllm_config:
+                    wrapper.concrete_aclgraph_entries = graph_entries[enabled].setdefault(wrapper, {})
+            context = nullcontext() if enabled else dumper.suspend_capture()
+            with context:
+                result = capture_fn(*args, **kwargs)
+            for wrapper in list(ACLGraphWrapper._all_instances):
+                if wrapper.vllm_config is self.vllm_config:
+                    graph_entries[enabled][wrapper] = wrapper.concrete_aclgraph_entries
+        return result
+
+    def _warmup_and_capture(self, *args, **kwargs):
+        return self._capture_msprobe_graph_variants(super()._warmup_and_capture, *args, **kwargs)
+
     def initialize_kv_cache(
         self,
         kv_cache_config: KVCacheConfig,
@@ -4969,8 +4995,24 @@ class NPUModelRunner(GPUModelRunner):
 
     def profile_cudagraph_memory(self) -> int:
         parent_module_name = _get_gpu_model_runner_module_name(self)
-        with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
-            result = GPUModelRunner.profile_cudagraph_memory(self)
+        dumper = self._msprobe_dual_graph_dumper()
+        if dumper is not None:
+            was_active = dumper.dual_graph_replay_active
+            dumper.deactivate_dual_graph_replay()
+            self._msprobe_dual_graph_entries = ({}, {})
+            self._msprobe_dual_graph_capturing = True
+        try:
+            with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+                result = GPUModelRunner.profile_cudagraph_memory(self)
+        finally:
+            if dumper is not None:
+                self._msprobe_dual_graph_capturing = False
+                for entries_by_wrapper in self._msprobe_dual_graph_entries:
+                    for entries in entries_by_wrapper.values():
+                        entries.clear()
+                self._msprobe_dual_graph_entries = ({}, {})
+                if was_active:
+                    dumper.activate_dual_graph_replay()
 
         reset_graph_params()
 
@@ -4992,8 +5034,27 @@ class NPUModelRunner(GPUModelRunner):
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""
         parent_module_name = _get_gpu_model_runner_module_name(self)
-        with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
-            cuda_graph_size = GPUModelRunner.capture_model(self)
+        dumper = self._msprobe_dual_graph_dumper()
+        if dumper is not None:
+            if self.is_multimodal_model:
+                raise RuntimeError("capture_both_states does not support multimodal encoder graphs")
+            dumper.deactivate_dual_graph_replay()
+            self._msprobe_dual_graph_entries = ({}, {})
+            self._msprobe_dual_graph_capturing = True
+        try:
+            with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+                cuda_graph_size = GPUModelRunner.capture_model(self)
+        finally:
+            if dumper is not None:
+                self._msprobe_dual_graph_capturing = False
+
+        if dumper is not None:
+            clean_entries, dump_entries = self._msprobe_dual_graph_entries
+            for wrapper in clean_entries.keys() | dump_entries.keys():
+                wrapper.set_msprobe_graph_entries(
+                    dumper, clean_entries.get(wrapper, {}), dump_entries.get(wrapper, {})
+                )
+            dumper.activate_dual_graph_replay()
 
         mgr = self.encoder_cudagraph_manager
         if mgr is not None and hasattr(self, "update_stream"):

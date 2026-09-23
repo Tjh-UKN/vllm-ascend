@@ -1,4 +1,5 @@
 import unittest
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -6,7 +7,84 @@ import numpy as np
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
+from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+
+class TestMsprobeDualGraphCapture(unittest.TestCase):
+    def test_captures_clean_and_dump_entries_for_same_wrapper(self):
+        class Dumper:
+            capture_both_states = True
+            is_running = True
+            suspended = False
+
+            @contextmanager
+            def suspend_capture(self):
+                self.suspended = True
+                try:
+                    yield
+                finally:
+                    self.suspended = False
+
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.vllm_config = object()
+        runner.debugger = Dumper()
+        runner._msprobe_dual_graph_capturing = True
+        runner._msprobe_dual_graph_entries = ({}, {})
+        wrapper = MagicMock()
+        wrapper.vllm_config = runner.vllm_config
+        wrapper.concrete_aclgraph_entries = {}
+
+        def capture():
+            variant = "clean" if runner.debugger.suspended else "dump"
+            wrapper.concrete_aclgraph_entries["batch"] = variant
+            return variant
+
+        with patch.object(ACLGraphWrapper, "_all_instances", {wrapper}):
+            result = runner._capture_msprobe_graph_variants(capture)
+
+        self.assertEqual(result, "dump")
+        self.assertEqual(runner._msprobe_dual_graph_entries[0][wrapper], {"batch": "clean"})
+        self.assertEqual(runner._msprobe_dual_graph_entries[1][wrapper], {"batch": "dump"})
+
+    def test_capture_model_installs_both_variants_before_replay(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.vllm_config = object()
+        runner.debugger = MagicMock(capture_both_states=True, is_running=True)
+        runner.debugger.suspend_capture.return_value = nullcontext()
+        runner.is_multimodal_model = False
+        runner.encoder_cudagraph_manager = None
+        wrapper = MagicMock()
+        wrapper.vllm_config = runner.vllm_config
+        wrapper.concrete_aclgraph_entries = {}
+        variants = iter(("clean", "dump"))
+
+        def capture_entry():
+            wrapper.concrete_aclgraph_entries["batch"] = next(variants)
+
+        def capture_model(_runner):
+            runner._capture_msprobe_graph_variants(capture_entry)
+            return 123
+
+        with (
+            patch.object(ACLGraphWrapper, "_all_instances", {wrapper}),
+            patch("vllm_ascend.worker.model_runner_v1._get_gpu_model_runner_module_name", return_value="runner"),
+            patch("vllm_ascend.worker.model_runner_v1._torch_cuda_wrapper", return_value=nullcontext()),
+            patch("vllm_ascend.worker.model_runner_v1._replace_gpu_model_runner_function_wrapper",
+                  return_value=nullcontext()),
+            patch("vllm_ascend.worker.model_runner_v1.GPUModelRunner.capture_model",
+                  autospec=True, side_effect=capture_model),
+        ):
+            graph_size = runner.capture_model()
+
+        self.assertEqual(graph_size, 123)
+        clean, dump = runner._msprobe_dual_graph_entries
+        wrapper.set_msprobe_graph_entries.assert_called_once_with(
+            runner.debugger, clean[wrapper], dump[wrapper]
+        )
+        self.assertEqual(clean[wrapper], {"batch": "clean"})
+        self.assertEqual(dump[wrapper], {"batch": "dump"})
+        runner.debugger.activate_dual_graph_replay.assert_called_once()
 
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):
