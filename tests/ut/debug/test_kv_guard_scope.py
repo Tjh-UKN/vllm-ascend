@@ -1,55 +1,113 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Outputs without a guaranteed sole consumer retain synchronous checking."""
+"""Per-runner ownership, explicit unsupported modes, and capture isolation."""
 
 from types import SimpleNamespace as NS
 
 import pytest
 
-from .test_kv_guard_runtime import runtime_fixture as runtime_fixture
-from .test_kv_guard_v2 import adapter_fixture as adapter_fixture
-from .test_kv_guard_v2 import message, prepare
+from .helpers import metadata, reasons
 
 
-@pytest.mark.parametrize("pooling,tp,pp", [(False, 1, 1), (True, 1, 1), (False, 2, 1), (False, 1, 2)])
-def test_only_single_worker_generation_can_defer_checks_to_sample_output(adapter, pooling, tp, pp):
-    runtime = adapter.runtime
-    runtime.config.scheduler_config = NS(async_scheduling=True)
-    adapter.runner.sample_tokens = lambda grammar: None
-    adapter.runner.is_pooling_model = pooling
-    runtime.config.parallel_config.tensor_parallel_size = tp
-    runtime.config.parallel_config.pipeline_parallel_size = pp
-    runtime.configure(adapter.runner)
-    assert runtime._defer_audit is (not pooling and tp == 1 and pp == 1)
+def runner_for(config, impl_name="AscendAttentionBackendImpl"):
+    impl = type(impl_name, (), {})()
+    config.compilation_config.static_forward_context = {"layer0": NS(impl=impl)}
+    spec = NS(block_size=4, head_size=16)
+    return NS(kv_cache_config=NS(kv_cache_groups=[NS(kv_cache_spec=spec, layer_names=["layer0"])])), impl
 
 
-@pytest.mark.parametrize("pooling,tp,pp", [(True, 1, 1), (False, 2, 1), (False, 1, 2)])
-def test_failure_is_detected_before_pool_or_nonreply_output_can_bypass_the_getter(adapter, pooling, tp, pp):
-    runtime = adapter.runtime
-    runtime.config.scheduler_config = NS(async_scheduling=True)
-    adapter.runner.sample_tokens = lambda grammar: None
-    adapter.runner.is_pooling_model = pooling
-    runtime.config.parallel_config.tensor_parallel_size = tp
-    runtime.config.parallel_config.pipeline_parallel_size = pp
-    runtime.action = "raise"
-    runtime.state.emit = runtime.report
-    runtime.configure(adapter.runner)
-    with pytest.raises(runtime.subject.KVGuardError, match="write_target_mismatch"):
-        adapter.wrap_execute(lambda output: prepare(adapter, ["r"], [129], [[1]], [1], "FULL"))(message())
-    assert runtime._pending is None
+def test_disabled_has_no_runtime_or_config_side_effect(subject, config):
+    config.additional_config = {}
+    assert subject.create_guard(config) is None
+    assert not hasattr(config, "_ascend_kv_guard")
 
 
-@pytest.mark.parametrize("missing", ["pooling", "tp", "pp"])
-def test_unknown_output_layout_keeps_synchronous_validation(adapter, missing):
-    runtime = adapter.runtime
-    runtime.config.scheduler_config = NS(async_scheduling=True)
-    adapter.runner.sample_tokens = lambda grammar: None
-    adapter.runner.is_pooling_model = False
-    parallel = runtime.config.parallel_config
-    parallel.tensor_parallel_size = parallel.pipeline_parallel_size = 1
-    if missing == "pooling":
-        del adapter.runner.is_pooling_model
+def test_same_config_creates_independent_per_runner_state(subject, config):
+    first, second = subject.create_guard(config), subject.create_guard(config)
+    first.state.requests["r"] = ([2],)
+    assert first is not second
+    assert second.state.requests == {}
+    assert not hasattr(config, "_ascend_kv_guard")
+
+
+@pytest.mark.parametrize(
+    "options", [{"enabled": "yes"}, {"enabled": 1}, {"action": "ignore"}, {"enabled": True, "typo": 1}]
+)
+def test_config_rejects_invalid_options(subject, config, options):
+    config.additional_config = {"kv_guard_config": options}
+    with pytest.raises(ValueError):
+        subject.create_guard(config)
+
+
+@pytest.mark.parametrize("impl_name", ["AscendAttentionBackendImpl", "AscendMLAImpl"])
+def test_attention_only_validated_and_declared_model_state_bound(runtime, config, impl_name):
+    runner, impl = runner_for(config, impl_name)
+    runner.model_state = NS(kv_guard=None)
+    runner.block_tables = NS(block_sizes=[4], kernel_block_sizes=[4])
+    runtime.configure(runner)
+    assert not hasattr(impl, "kv_guard")
+    assert runner.model_state.kv_guard is runtime
+    assert runtime.layer_groups == {"layer0": 0}
+
+
+def test_empty_cache_groups_cannot_claim_guard_enabled(runtime):
+    with pytest.raises(ValueError, match="no supported attention layers"):
+        runtime.configure(NS(kv_cache_config=NS(kv_cache_groups=[])))
+
+
+@pytest.mark.parametrize(
+    "mode", ["connector", "cp", "dbo", "speculation", "encoder", "sliding", "compressed", "coordinates", "model_state"]
+)
+def test_unsupported_modes_fail_before_execution(runtime, config, mode):
+    runner, _ = runner_for(config)
+    spec = runner.kv_cache_config.kv_cache_groups[0].kv_cache_spec
+    if mode == "connector":
+        config.kv_transfer_config = NS(kv_connector="MooncakeConnector")
+    elif mode == "cp":
+        config.parallel_config.decode_context_parallel_size = 2
+    elif mode == "dbo":
+        config.parallel_config.enable_dbo = True
+    elif mode == "speculation":
+        config.speculative_config = NS()
+    elif mode == "encoder":
+        config.model_config.is_encoder_decoder = True
+    elif mode == "sliding":
+        spec.sliding_window = 16
+    elif mode == "compressed":
+        spec.compress_ratio = 4
+    elif mode == "coordinates":
+        runner.block_tables = NS(block_sizes=[4], kernel_block_sizes=[2])
     else:
-        delattr(parallel, "tensor_parallel_size" if missing == "tp" else "pipeline_parallel_size")
-    runtime.configure(adapter.runner)
-    assert not runtime._defer_audit
+        runner.model_state = NS()
+    with pytest.raises(ValueError, match="unsupported"):
+        runtime.configure(runner)
+
+
+@pytest.mark.parametrize("full_graph", [False, True])
+def test_dummy_live_write_uses_current_group_plan(runtime, full_graph):
+    runtime.state.requests = {"r": ([2],)}
+    with runtime.dummy_scope(NS()):
+        runtime.observe_metadata({"layer0": metadata([9], [[2]], [1])}, [], full_graph)
+    assert "dummy_write_to_live_block" in reasons(runtime)
+    assert runtime.state.requests == {"r": ([2],)}
+
+
+def test_dummy_scratch_is_allowed(runtime):
+    runtime.state.requests = {"r": ([2],)}
+    with runtime.dummy_scope(NS()):
+        runtime.observe_metadata({"layer0": metadata([-1, 0, 12], [[0]], [0])}, [])
+    assert not runtime.events
+
+
+@pytest.mark.parametrize("phase", ["warmup", "capture"])
+def test_startup_capture_never_materializes_tensor_metadata(runtime, monkeypatch, phase):
+    monkeypatch.setattr(runtime, "_list", lambda _: pytest.fail("CPU metadata read during capture"))
+    with runtime.dummy_scope(NS(), phase=phase):
+        runtime.observe_metadata({"layer0": metadata([8], [[2]], [1])}, [], True)
+    assert not runtime.events
+
+
+def test_live_recapture_is_explicitly_rejected(runtime):
+    runtime.state.requests = {"r": ([2],)}
+    with pytest.raises(ValueError, match="no live requests"):
+        runtime.check_capture()

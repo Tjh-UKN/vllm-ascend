@@ -76,7 +76,7 @@ from vllm_ascend.core.profiling_chunk_predictor import (
     _finish_profiling_chunk_timing,
     _start_profiling_chunk_timing,
 )
-from vllm_ascend.debug.kv_guard_runtime import install_guard
+from vllm_ascend.debug.kv_guard_runtime import GuardRuntime, create_guard
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
     bind_dspark_context_receiver,
     configure_dspark_kv_transfer,
@@ -140,6 +140,8 @@ from vllm_ascend.worker.v2.utils import (
 
 class NPUModelRunner(GPUModelRunner):
     """Model runner for Ascend NPUs."""
+
+    _kv_guard: GuardRuntime | None = None
 
     # vLLM #51718 overlays hybrid Attention/Mamba groups in one standardized
     # backing allocation. Ascend MRV2 preserves that allocation and exposes
@@ -289,7 +291,7 @@ class NPUModelRunner(GPUModelRunner):
 
                 self.debugger = AclGraphDumper(dump_cfg)
         self.runtime_guard = RuntimeGuardProcessor.bind(self)
-        self._kv_guard = install_guard(self)
+        self._kv_guard = create_guard(vllm_config)
 
     @property
     def pcp_manager_cls(self) -> type[AscendPCPManager]:
@@ -323,6 +325,8 @@ class NPUModelRunner(GPUModelRunner):
 
     @runtime_guard_sample_tokens
     def sample_tokens(self, grammar_output):
+        if self._kv_guard is not None:
+            self._kv_guard.check_failure()
         if (
             lmhead_tp_enable()
             and self.prompt_logprobs_worker is not None
@@ -520,7 +524,7 @@ class NPUModelRunner(GPUModelRunner):
         self.model_state.kvpp_runtime = self.kvpp
 
         self._fill_c8_mxfp_v_scale_caches()
-        guard = getattr(self, "_kv_guard", None)
+        guard = self._kv_guard
         if guard is not None:
             guard.configure(self)
 
@@ -583,6 +587,8 @@ class NPUModelRunner(GPUModelRunner):
     @torch.inference_mode()
     def capture_model(self, *, profile_only: bool = False) -> int:
         """Capture decoder and multimodal encoder graphs on Ascend."""
+        if self._kv_guard is not None:
+            self._kv_guard.check_capture()
         if hasattr(self, "model_state") and self.model_state.supports_mm_inputs:
             encoder_runner = getattr(self.model_state, "encoder_runner", None)
             encoder_manager = getattr(encoder_runner, "cudagraph_manager", None)
@@ -641,7 +647,13 @@ class NPUModelRunner(GPUModelRunner):
         )
         profile_kwargs = {"randomize_inputs": randomize_inputs}
         forward_failed = True
-        with dp_coordination_context:
+        guard_scope = nullcontext()
+        if self._kv_guard is not None:
+            if dummy_run or is_profile:
+                guard_scope = self._kv_guard.dummy_scope(self, phase="warmup" if is_profile else "dummy")
+            else:
+                guard_scope = self._kv_guard.execution(self, scheduler_output)
+        with guard_scope, dp_coordination_context:
             try:
                 output = super().execute_model(
                     scheduler_output,

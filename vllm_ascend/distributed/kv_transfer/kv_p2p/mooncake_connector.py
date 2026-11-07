@@ -756,8 +756,7 @@ class KVCacheRecvingThread(threading.Thread):
         finally:
             all_tasks_done = self._mark_request_task_done(request_id, all_task_done)
             if all_tasks_done:
-                transfer_failed = transfer_failed or self._is_failed_recv_request(request_id)
-                if transfer_failed:
+                if transfer_failed or self._is_failed_recv_request(request_id):
                     with self.pending_reformat_lock:
                         self.pending_reformat.pop(request_id, None)
                 else:

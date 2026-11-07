@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Per-engine KV guard options, usable before AscendConfig initialization."""
+"""Per-engine options for worker KV metadata-plan diagnostics."""
 
 from typing import Any, Literal
 
