@@ -13,7 +13,11 @@ def runner_for(config, impl_name="AscendAttentionBackendImpl"):
     impl = type(impl_name, (), {})()
     config.compilation_config.static_forward_context = {"layer0": NS(impl=impl)}
     spec = NS(block_size=4, head_size=16)
-    return NS(kv_cache_config=NS(kv_cache_groups=[NS(kv_cache_spec=spec, layer_names=["layer0"])])), impl
+    return NS(
+        kv_cache_config=NS(kv_cache_groups=[NS(kv_cache_spec=spec, layer_names=["layer0"])]),
+        model_state=NS(kv_guard=None),
+        block_tables=NS(block_sizes=[4], kernel_block_sizes=[4]),
+    ), impl
 
 
 def test_disabled_has_no_runtime_or_config_side_effect(subject, config):
@@ -42,12 +46,26 @@ def test_config_rejects_invalid_options(subject, config, options):
 @pytest.mark.parametrize("impl_name", ["AscendAttentionBackendImpl", "AscendMLAImpl"])
 def test_attention_only_validated_and_declared_model_state_bound(runtime, config, impl_name):
     runner, impl = runner_for(config, impl_name)
-    runner.model_state = NS(kv_guard=None)
-    runner.block_tables = NS(block_sizes=[4], kernel_block_sizes=[4])
     runtime.configure(runner)
     assert not hasattr(impl, "kv_guard")
     assert runner.model_state.kv_guard is runtime
     assert runtime.layer_groups == {"layer0": 0}
+
+
+@pytest.mark.parametrize("model_state", [None, NS()])
+def test_v2_model_state_must_declare_guard_member(runtime, config, model_state):
+    runner, impl = runner_for(config)
+    runner.model_state = model_state
+    with pytest.raises(ValueError, match="unsupported V2 model state"):
+        runtime.configure(runner)
+    assert not hasattr(impl, "kv_guard")
+
+
+def test_runner_without_v2_model_state_is_rejected(runtime, config):
+    runner, _ = runner_for(config)
+    del runner.model_state
+    with pytest.raises(ValueError, match="unsupported V2 model state"):
+        runtime.configure(runner)
 
 
 def test_empty_cache_groups_cannot_claim_guard_enabled(runtime):

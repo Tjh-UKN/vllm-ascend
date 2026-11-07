@@ -152,7 +152,6 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
-from vllm_ascend.debug.kv_guard_runtime import GuardRuntime, create_guard
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h import get_prebound_copy_sfa_slots
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
@@ -379,8 +378,6 @@ class ExecuteModelState(NamedTuple):
 
 
 class NPUModelRunner(GPUModelRunner):
-    _kv_guard: GuardRuntime | None = None
-
     # vLLM #51718 describes compatible KV cache groups as views over one
     # standardized backing allocation. The default runner preserves that
     # contract for its layer/block-compact Attention+Mamba path.
@@ -399,8 +396,6 @@ class NPUModelRunner(GPUModelRunner):
 
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
-
-        self._kv_guard = create_guard(vllm_config)
         self.lookback_token_ids: CpuGpuBuffer | None = None
 
         self.device_metadata_executor: DeviceMetadataExecutor | None = None
@@ -2354,15 +2349,6 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        guard = self._kv_guard
-        with guard.execution(self, scheduler_output) if guard is not None else nullcontext():
-            return self._execute_model(scheduler_output, intermediate_tensors)
-
-    def _execute_model(
-        self,
-        scheduler_output: "SchedulerOutput",
-        intermediate_tensors: IntermediateTensors | None = None,
-    ) -> ModelRunnerOutput | IntermediateTensors | None:
         self._cpp_execution_time_ms = None
         profiling_chunk_config = self.ascend_config.scheduler_config.profiling_chunk_config
         execution_start_time = _start_profiling_chunk_timing(
@@ -2896,8 +2882,6 @@ class NPUModelRunner(GPUModelRunner):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
-        if self._kv_guard is not None:
-            self._kv_guard.check_failure()
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
         pp = get_pp_group()
@@ -3589,12 +3573,6 @@ class NPUModelRunner(GPUModelRunner):
             if executor is not None and executor.submission_in_flight:
                 executor.release()
 
-        if self._kv_guard is not None:
-            self._kv_guard.observe_metadata(
-                forward_context.attn_metadata,
-                request_ids=list(self.input_batch.req_ids),
-                full_graph=forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL,
-            )
         return hidden_states
 
     def _prepare_device_metadata_for_forward(
@@ -4597,17 +4575,14 @@ class NPUModelRunner(GPUModelRunner):
                 if not is_graph_capturing and self.ascend_config.enable_force_eplb \
                     and self.vllm_config.model_config.is_moe:
                     build_force_eplb_topk(self.device, self.max_num_tokens)
-                guard = self._kv_guard
-                phase = "warmup" if is_profile or is_graph_capturing else "dummy"
-                with guard.dummy_scope(self, phase=phase) if guard is not None else nullcontext():
-                    outputs = self._model_forward(
-                        num_tokens_padded,
-                        input_ids,
-                        positions,
-                        intermediate_tensors,
-                        inputs_embeds,
-                        decoder_replay_dummy=True,
-                    )
+                outputs = self._model_forward(
+                    num_tokens_padded,
+                    input_ids,
+                    positions,
+                    intermediate_tensors,
+                    inputs_embeds,
+                    decoder_replay_dummy=True,
+                )
             if active_device_metadata_executor is not None and active_device_metadata_executor.submission_in_flight:
                 active_device_metadata_executor.release()
             self.kvpp.complete_forward()
@@ -5131,9 +5106,6 @@ class NPUModelRunner(GPUModelRunner):
         kv_caches = self._reshape_kv_cache_tensors(
             kv_cache_config, kv_cache_raw_tensors, kernel_block_sizes
         )
-        guard = self._kv_guard
-        if guard is not None:
-            guard.configure(self)
 
         # Set up cross-layer KV cache sharing
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
@@ -6969,8 +6941,6 @@ class NPUModelRunner(GPUModelRunner):
 
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""
-        if self._kv_guard is not None:
-            self._kv_guard.check_capture()
         parent_module_name = _get_gpu_model_runner_module_name(self)
         self._engram_capture_active = True
         try:

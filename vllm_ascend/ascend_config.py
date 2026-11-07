@@ -692,6 +692,8 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        if self.kv_guard_config.enabled and not vc.use_v2_model_runner:
+            raise ValueError("KV guard requires Model Runner V2")
         engram_config = getattr(vc, "engram_config", None)
         if (
             engram_config is not None

@@ -1,16 +1,16 @@
 # KV cache address guard
 
-KV Guard compares the scheduler's declared token destinations with the runner's
+KV Guard in Model Runner V2 compares the scheduler's declared token destinations with the runner's
 final attention metadata, once per KV cache group. Eager and FULL graph modes
 use the same metadata-plan checks. Attention implementations are unchanged;
 operator arguments and per-layer execution order are not recorded.
 
 ## Enable the guard
 
-The guard is disabled by default. Enable it for an engine with:
+The guard is disabled by default and requires Model Runner V2. Enable it for an engine with:
 
 ```bash
-vllm serve MODEL --additional-config '{"kv_guard_config":{"enabled":true,"action":"raise"}}'
+VLLM_USE_V2_MODEL_RUNNER=1 vllm serve MODEL --additional-config '{"kv_guard_config":{"enabled":true,"action":"raise"}}'
 ```
 
 | Option | Type | Default | Meaning |
@@ -21,6 +21,7 @@ vllm serve MODEL --additional-config '{"kv_guard_config":{"enabled":true,"action
 The Python API accepts the same `additional_config` dictionary. Unknown fields,
 non-boolean `enabled` values and unknown actions are rejected. Each runner owns
 its guard; the configuration object does not hold mutable checking state.
+Enabling the guard with Model Runner V1 raises a configuration error.
 
 `raise` latches the first violation or incomplete audit. Catching an exception
 does not reset the guard; restart the worker before reuse. There is no collective
@@ -61,7 +62,7 @@ methods are not replaced at runtime.
 
 ## Coverage boundaries
 
-Dense PA and MLA append-only cache paths in Runner V1/V2 are adapted. The guard
+Dense PA and MLA append-only cache paths in Runner V2 are adapted. The guard
 checks consistency between scheduler messages and selected metadata. It does
 not prove that a particular layer executed, that operator arguments matched
 the metadata, or that a kernel used those addresses.
@@ -103,7 +104,7 @@ Run focused tests with:
 pytest -q --confcutdir=tests/ut/debug tests/ut/debug
 ```
 
-The service regression compares disabled/enabled greedy outputs for V1/V2,
+The service regression compares disabled/enabled greedy outputs for Runner V2,
 eager/FULL, repeated prompts and concurrent requests:
 
 ```bash

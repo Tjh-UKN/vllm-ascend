@@ -8,7 +8,6 @@ from tests.e2e.conftest import RemoteOpenAIServer, wait_until_npu_memory_free
 
 
 @pytest.mark.e2e_model("Qwen/Qwen3-0.6B")
-@pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
 @pytest.mark.parametrize(
     "graph_mode",
     [
@@ -39,7 +38,7 @@ from tests.e2e.conftest import RemoteOpenAIServer, wait_until_npu_memory_free
     ],
 )
 @wait_until_npu_memory_free()
-def test_guard_preserves_sequential_and_concurrent_generation(use_v2, graph_mode):
+def test_guard_preserves_sequential_and_concurrent_generation(graph_mode):
     model = "Qwen/Qwen3-0.6B"
     prompt = "Explain how a key value cache works. " * 40
     arguments = [
@@ -65,7 +64,7 @@ def test_guard_preserves_sequential_and_concurrent_generation(use_v2, graph_mode
     results = []
     for enabled in (False, True):
         port = get_open_port()
-        environment = {"VLLM_USE_V2_MODEL_RUNNER": str(int(use_v2))}
+        environment = {"VLLM_USE_V2_MODEL_RUNNER": "1"}
         with (
             RemoteOpenAIServer(
                 model,

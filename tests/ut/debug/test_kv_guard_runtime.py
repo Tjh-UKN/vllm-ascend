@@ -11,7 +11,7 @@ from .helpers import message, metadata, observe, reasons
 
 
 @pytest.mark.parametrize("full_graph", [False, True])
-def test_prefix_append_is_a_metadata_plan_for_both_runner_modes(runtime, full_graph):
+def test_v2_prefix_append_is_a_metadata_plan_for_eager_and_full(runtime, full_graph):
     with runtime.execution(NS(), message(new=[("r", ([2, 3],), 3)], counts={"r": 3})):
         observe(runtime, ["r"], [11, 12, 13], [[2, 3]], [6], full_graph=full_graph)
     assert not runtime.events
@@ -27,7 +27,7 @@ def test_full_graph_padding_requires_zero_lengths_after_real_rows(runtime, lengt
 
 
 def test_corrupted_runner_table_cannot_change_shadow_plan(runtime):
-    runner = NS(input_batch=NS(req_ids=["r"], block_table=[[99]]))
+    runner = NS(block_tables=NS(block_table=[[99]]))
     with runtime.execution(runner, message(new=[("r", ([2],), 0)], counts={"r": 1})):
         observe(runtime, ["r"], [396], [[99]], [1])
     assert "write_target_mismatch" in reasons(runtime)
@@ -141,7 +141,7 @@ def test_only_actual_slot_prefix_is_materialized_from_padded_buffer(runtime, mon
 def test_full_graph_requires_fresh_metadata_every_step(runtime):
     with runtime.execution(NS(), message(new=[("r", ([2],), 0)], counts={"r": 1})):
         observe(runtime, ["r"], [8], [[2]], [1], full_graph=True)
-    with runtime.execution(NS(input_batch=NS(req_ids=["r"])), message(cached=[("r", None, 1)], counts={"r": 1})):
+    with runtime.execution(NS(), message(cached=[("r", None, 1)], counts={"r": 1})):
         pass
     assert "metadata_group_missing" in reasons(runtime)
 
@@ -151,6 +151,13 @@ def test_batch_identity_mismatch_is_a_coverage_gap(runtime, batch):
     with runtime.execution(NS(), message(new=[("r", ([2],), 0)], counts={"r": 1})):
         observe(runtime, batch, [8], [[2]], [1])
     assert "batch_request_mismatch" in reasons(runtime)
+
+
+def test_actual_batch_ids_must_be_explicitly_observed(runtime):
+    runner = NS(input_batch=NS(req_ids=["r"]))
+    with runtime.execution(runner, message(new=[("r", ([2],), 0)], counts={"r": 1})):
+        runtime.observe_metadata({"layer0": metadata([8], [[2]], [1])})
+    assert "batch_request_ids_missing" in reasons(runtime)
 
 
 def test_no_token_step_can_release_without_a_forward(runtime):

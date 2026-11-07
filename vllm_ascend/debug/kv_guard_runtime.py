@@ -103,15 +103,11 @@ class GuardRuntime:
             list(tables.block_sizes) != list(sizes.values()) or list(tables.kernel_block_sizes) != list(sizes.values())
         ):
             raise ValueError("KV guard: unsupported allocator/kernel block coordinates")
-        batch_tables = getattr(getattr(getattr(runner, "input_batch", None), "block_table", None), "block_tables", ())
-        if batch_tables and any(table.block_size != sizes[index] for index, table in enumerate(batch_tables)):
-            raise ValueError("KV guard: unsupported allocator/kernel block coordinates")
         model_state = getattr(runner, "model_state", None)
-        if model_state is not None and not hasattr(model_state, "kv_guard"):
-            raise ValueError("KV guard: unsupported model state")
+        if model_state is None or not hasattr(model_state, "kv_guard"):
+            raise ValueError("KV guard: unsupported V2 model state")
         self.state.configure(sizes)
-        if model_state is not None:
-            model_state.kv_guard = self
+        model_state.kv_guard = self
         self.report("guard.enabled", failure_action=self.action)
 
     def observe_metadata(self, metadata: Any, request_ids: list[str] | None = None, full_graph: bool = False) -> None:
@@ -145,7 +141,7 @@ class GuardRuntime:
         slots = [slot for row in slots for slot in (row if isinstance(row, list) else [row])]
         return slots
 
-    def _audit(self, runner: Any) -> None:
+    def _audit(self) -> None:
         if not self.state.scheduled:
             for group, metadata in self._metadata.items():
                 slots = self._slots(metadata, group)
@@ -156,12 +152,13 @@ class GuardRuntime:
                     self.report("guard.violation", reason="unscheduled_attention_plan", group_id=group)
             return
         request_ids = self._request_ids
-        if request_ids is None:
-            request_ids = list(getattr(getattr(runner, "input_batch", None), "req_ids", ()))
         for group in self.state.group_sizes:
             metadata = self._metadata.get(group)
             if metadata is None:
                 self.gap("metadata_group_missing", group_id=group)
+                continue
+            if request_ids is None:
+                self.gap("batch_request_ids_missing", group_id=group)
                 continue
             if len(request_ids) != len(set(request_ids)) or set(request_ids) != set(self.state.scheduled):
                 self.gap("batch_request_mismatch", group_id=group)
@@ -205,7 +202,7 @@ class GuardRuntime:
             self.check_failure()
             yield
             try:
-                self._audit(runner)
+                self._audit()
             except Exception as exc:
                 self.gap(f"access_audit_failed:{type(exc).__name__}")
             self.check_failure()
