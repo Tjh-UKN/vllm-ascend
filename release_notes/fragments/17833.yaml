@@ -1,0 +1,13 @@
+pr: 17833
+entries:
+  - category: feature
+    text: >-
+      Added opt-in KV cache metadata-plan diagnostics for dense PA and MLA paths
+      in Runner V2. Each cache group is checked once using final attention
+      metadata in both eager and FULL modes; attention implementations are
+      unchanged and operator/per-layer accesses are not recorded. Standard
+      scheduler messages provide the independent expected address plan, without
+      Scheduler/allocator patches or runtime method replacement. Per-engine
+      additional_config.kv_guard_config supports log or sticky raise actions.
+      Audits complete synchronously. Allocator generations, initialized-prefix
+      validity and KV connectors are outside this feature's scope.
