@@ -52,6 +52,7 @@ from vllm_ascend.ascend_config import (
     init_ascend_config,
     is_mega_moe_supported,
 )
+from vllm_ascend.debug.kv_guard_config import KVGuardConfig
 from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.utils import clear_enable_sp, enable_sp, shared_expert_dp_enabled
@@ -2231,6 +2232,35 @@ class TestKVPPConfig(TestBase):
         config.additional_config = {"enable_kvpp": True}
         actual = init_ascend_config(config)
         self.assertEqual(actual.kvpp_config.size, 4)
+
+
+class TestKVGuardRunnerSelection(TestBase):
+    def test_enabled_rejects_model_runner_v1(self):
+        config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+        ascend_config = AscendConfig(
+            kv_guard_config=KVGuardConfig(enabled=True), sparse_kv_offload_config=SparseKVOffloadConfig()
+        )
+        with (
+            patch.object(_VllmConfig, "use_v2_model_runner", new_callable=PropertyMock, return_value=False),
+            self.assertRaisesRegex(ValueError, "requires Model Runner V2"),
+        ):
+            ascend_config.derive_and_validate(config)
+
+    def test_enabled_accepts_model_runner_v2(self):
+        config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+        ascend_config = AscendConfig(
+            kv_guard_config=KVGuardConfig(enabled=True), sparse_kv_offload_config=SparseKVOffloadConfig()
+        )
+        with patch.object(_VllmConfig, "use_v2_model_runner", new_callable=PropertyMock, return_value=True):
+            ascend_config.derive_and_validate(config)
+        self.assertTrue(ascend_config.kv_guard_config.enabled)
+
+    def test_disabled_preserves_model_runner_v1(self):
+        config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+        ascend_config = AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig())
+        with patch.object(_VllmConfig, "use_v2_model_runner", new_callable=PropertyMock, return_value=False):
+            ascend_config.derive_and_validate(config)
+        self.assertFalse(ascend_config.kv_guard_config.enabled)
 
 
 class TestEngramSharedMemoryDefaults(TestBase):

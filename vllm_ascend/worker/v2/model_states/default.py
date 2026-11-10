@@ -62,6 +62,7 @@ class ReplayAttnMetadata(ModelSpecificAttnMetadata):
 if TYPE_CHECKING:
     from vllm_ascend.attention.dsa_v41 import AscendDSAV41Metadata, AscendDSAV41MetadataBuilder
     from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+    from vllm_ascend.debug.kv_guard_runtime import GuardRuntime
     from vllm_ascend.models.deepseek_v41.decoder_replay_layers import AscendDecoderReplayLayers
     from vllm_ascend.worker.device_metadata import TargetDeviceMetadata
     from vllm_ascend.worker.v2.kvpp import KVPPRuntime
@@ -71,6 +72,7 @@ if TYPE_CHECKING:
 class AscendModelState(DefaultModelState):
     """Model state for Ascend NPUs."""
 
+    kv_guard: "GuardRuntime | None" = None
     pcp_manager: "AscendPCPManager | None" = None
     pcp_context: "AscendPCPAttentionContext | None" = None
     kvpp_runtime: "KVPPRuntime | None" = None
@@ -84,6 +86,7 @@ class AscendModelState(DefaultModelState):
 
     def __init__(self, vllm_config, model, encoder_cache, device):
         super().__init__(vllm_config, model, encoder_cache, device)
+        self.kv_guard = None
         self._offload_req_ids: CpuGpuBuffer | None = None
         self._offload_token_to_req: CpuGpuBuffer | None = None
         self._offload_pool_slots: CpuGpuBuffer | None = None
@@ -573,4 +576,10 @@ class AscendModelState(DefaultModelState):
                 if getattr(metadata, "copy_sfa_copy_src_offsets", None) is not None:
                     manager.restore_copy_sfa_tails(metadata)
                     break
+        if self.kv_guard is not None and not for_capture:
+            self.kv_guard.observe_metadata(
+                self.attn_metadata,
+                request_ids=list(input_batch.req_ids[: input_batch.num_reqs]),
+                full_graph=cudagraph_mode == CUDAGraphMode.FULL,
+            )
         return self.attn_metadata
